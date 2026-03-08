@@ -1,21 +1,32 @@
 import { create } from 'zustand';
 import { User, Calculation, WizardData, CompanySettings, CatalogItem } from './types';
-import { DEFAULT_USERS, DEFAULT_COMPANY_SETTINGS, CATALOG_ITEMS, SECTIONS } from './constants';
+import { DEFAULT_COMPANY_SETTINGS, CATALOG_ITEMS } from './constants';
+import { supabase } from './supabaseClient';
 
 interface AppState {
   currentUser: User | null;
+  authLoading: boolean;
+  authError: string | null;
   companySettings: CompanySettings;
   calculations: Calculation[];
   catalogItems: CatalogItem[];
   wizardData: WizardData;
 
-  login: (email: string, password: string) => boolean;
-  logout: () => void;
+  // Auth
+  initAuth: () => () => void;
+  login: (email: string, password: string) => Promise<boolean>;
+  logout: () => Promise<void>;
+
+  // Wizard
   updateWizardData: (data: Partial<WizardData>) => void;
+  resetWizard: () => void;
+
+  // Calculations
   saveCalculation: (calculation: Calculation) => void;
   deleteCalculation: (id: string) => void;
   updateCalculation: (id: string, calculation: Calculation) => void;
-  resetWizard: () => void;
+
+  // Settings & Catalog
   updateCompanySettings: (settings: CompanySettings) => void;
   updateCatalogItems: (items: CatalogItem[]) => void;
 }
@@ -35,46 +46,92 @@ const defaultWizardData: WizardData = {
   items: [],
 };
 
-export const useStore = create<AppState>((set) => ({
+async function fetchProfile(userId: string): Promise<User | null> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .single();
+
+  if (error || !data) {
+    console.error('Failed to fetch profile:', error?.message);
+    return null;
+  }
+
+  return {
+    id: data.id,
+    email: data.email,
+    name: data.name,
+    role: data.role,
+    created_at: data.created_at,
+  };
+}
+
+export const useStore = create<AppState>((set, get) => ({
   currentUser: null,
+  authLoading: true,
+  authError: null,
   companySettings: DEFAULT_COMPANY_SETTINGS,
-  calculations: [
-    {
-      id: '1',
-      user_id: '2',
-      client_name: 'ООО "Примерная компания"',
-      client_phone: '+7 (999) 111-22-33',
-      client_email: 'client@example.ru',
-      client_address: 'г. Москва, ул. Тестовая, д. 5',
-      manager_comment: 'VIP клиент, срочно',
-      area: 250,
-      floors: 2,
-      foundation_type: 'Ленточный',
-      readiness: 'turnkey',
-      package: 'standard',
-      items: [],
-      total_cost: 7500000,
-      total_client_price: 9187500,
-      status: 'draft',
-      public_token: 'abc123def456',
-      created_at: new Date(Date.now() - 86400000).toISOString(),
-      updated_at: new Date(Date.now() - 86400000).toISOString(),
-    },
-  ],
+  calculations: [],
   catalogItems: CATALOG_ITEMS,
   wizardData: defaultWizardData,
 
-  login: (email: string, password: string) => {
-    const user = DEFAULT_USERS.find((u) => u.email === email && u.password === password);
-    if (user) {
-      set({ currentUser: user as User });
-      return true;
-    }
-    return false;
+  initAuth: () => {
+    set({ authLoading: true });
+
+    // Check existing session on init
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session?.user) {
+        const profile = await fetchProfile(session.user.id);
+        set({ currentUser: profile, authLoading: false });
+      } else {
+        set({ currentUser: null, authLoading: false });
+      }
+    });
+
+    // Listen for auth state changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        if (event === 'SIGNED_IN' && session?.user) {
+          const profile = await fetchProfile(session.user.id);
+          set({ currentUser: profile, authLoading: false });
+        } else if (event === 'SIGNED_OUT') {
+          set({ currentUser: null, authLoading: false });
+        }
+      }
+    );
+
+    // Return unsubscribe function for cleanup
+    return () => {
+      subscription.unsubscribe();
+    };
   },
 
-  logout: () => {
-    set({ currentUser: null });
+  login: async (email: string, password: string) => {
+    set({ authLoading: true, authError: null });
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (error) {
+      set({ authLoading: false, authError: error.message });
+      return false;
+    }
+
+    // Profile will be loaded by onAuthStateChange listener
+    return true;
+  },
+
+  logout: async () => {
+    set({ authLoading: true, authError: null });
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      console.error('Logout error:', error.message);
+      set({ authError: error.message });
+    }
+    set({ authLoading: false });
   },
 
   updateWizardData: (data: Partial<WizardData>) => {
